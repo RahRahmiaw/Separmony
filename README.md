@@ -4,6 +4,9 @@ Aplicación de escritorio en Python que separa una canción en 6 instrumentos
 usando el modelo `htdemucs_6s` de Demucs, con interfaz gráfica de
 arrastrar y soltar, y un reproductor integrado con control de volumen.
 
+## Sobre este proyecto
+Desarrollado mediante vibecoding con Claude, si no te gusta esto no te juzgaria.
+
 ## Modos de separación (eliges uno por cada canción)
 
 **Modo 1 — 6 instrumentos (rápido)**
