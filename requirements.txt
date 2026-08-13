@@ -1,0 +1,6 @@
+demucs
+tkinterdnd2
+pygame
+soundfile
+numpy
+torch
