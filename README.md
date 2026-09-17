@@ -138,6 +138,23 @@ python separator.py
    automatically (`Instruments OtherSongName (4/6 stems)`) inside the same
    parent folder, without overwriting the previous one.
 
+## Reopening previous separations
+
+The app remembers the last parent folder you used, so the next time you
+open it, that same folder is already selected. Right below it, a
+**"Previous separations in this folder"** section lists every separation
+it can find inside that folder (based on its folder name and the `.wav`
+files still present), most recent first. For each one you can:
+
+- **Load into mixer** — loads those stems straight into the mixer so you
+  can play, seek, and blend them, without running Demucs again.
+- **Open folder** — opens that separation's folder in your file explorer.
+- **Refresh** — rescans the parent folder, useful if you moved or deleted
+  folders manually.
+
+This means you only need to run the separation process once per song —
+after that, you can come back anytime and just reload the result.
+
 ## Resulting folder structure
 
 ```

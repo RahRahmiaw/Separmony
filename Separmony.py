@@ -24,6 +24,9 @@ Desktop GUI application that allows you to:
   or isolate/remove instruments live
 - A YouTube-style seek bar to scrub through the currently loaded mix
 - Detect and display whether GPU (CUDA) or CPU is being used
+- Remembers the last parent folder you used between runs, and lets you
+  browse and reload any previous separation found inside it without
+  having to run the separation process again
 
 Requirements (install before running, see requirements.txt):
     pip install -r requirements.txt
@@ -33,7 +36,9 @@ Usage:
 """
 
 import os
+import re
 import sys
+import json
 import threading
 import queue
 import subprocess
@@ -51,6 +56,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 import pygame
+import pygame.sndarray
 import numpy as np
 
 try:
@@ -111,6 +117,100 @@ COLOR_ACCENT_DARK = "#2563eb"
 COLOR_SUCCESS = "#22c55e"
 COLOR_ERROR = "#ef4444"
 COLOR_TRACK = "#132a52"       # slider track background
+
+# ----------------------------------------------------------------------
+# Persistent app settings (remembers the last parent folder between runs)
+# ----------------------------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".ai_instrument_separator"
+CONFIG_FILE = CONFIG_DIR / "settings.json"
+
+
+def load_settings():
+    """Loads persisted settings (e.g. last used parent folder) from disk.
+    Returns an empty dict if no settings file exists yet or it can't be read."""
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_settings(settings: dict):
+    """Persists settings (e.g. last used parent folder) to disk."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------
+# Previous separations discovery
+# ----------------------------------------------------------------------
+
+# Matches folders created by this app, e.g. "Instruments MySong (6 stems)".
+# Also matches the old Spanish naming ("Instrumentos ...") used by earlier
+# versions of this app, so separations made before the English rewrite are
+# still picked up.
+SEPARATION_FOLDER_RE = re.compile(r"^(?:Instruments|Instrumentos) (.+) \((\d+ stems(?: HQ)?)\)$")
+
+
+def find_previous_separations(parent_folder: str):
+    """
+    Scans the given parent folder for subfolders previously created by this
+    app (matching "Instruments <Song> (N stems[ HQ])") that still contain at
+    least one usable .wav stem. Returns a list of dicts sorted by most
+    recently modified first:
+        {"song": str, "label": str, "folder": Path, "files": {stem: path}, "mtime": float}
+    """
+    results = []
+    root = Path(parent_folder)
+    if not root.is_dir():
+        return results
+
+    all_stem_names = set(STEM_NAMES_6) | set(STEM_NAMES_4)
+
+    try:
+        entries = list(root.iterdir())
+    except Exception:
+        return results
+
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        match = SEPARATION_FOLDER_RE.match(entry.name)
+        if not match:
+            continue
+        song_name, stems_label = match.groups()
+
+        files = {}
+        for stem in all_stem_names:
+            candidate = entry / f"{stem}.wav"
+            if candidate.exists():
+                files[stem] = str(candidate)
+
+        if not files:
+            continue  # folder exists but has no usable stems anymore
+
+        try:
+            mtime = entry.stat().st_mtime
+        except Exception:
+            mtime = 0.0
+
+        results.append({
+            "song": song_name,
+            "label": stems_label,
+            "folder": entry,
+            "files": files,
+            "mtime": mtime,
+        })
+
+    results.sort(key=lambda r: r["mtime"], reverse=True)
+    return results
 
 
 # ----------------------------------------------------------------------
@@ -205,7 +305,7 @@ def run_separation(input_file: str, output_root: str, mode: str, log_queue: "que
     - MODE_6STEM: a single model (htdemucs_6s), 6 stems.
     - MODE_ENSEMBLE: runs 3 four-stem models and averages the results
       instrument by instrument to reduce artifacts.
-    - MODE_HYBRID_6STEM: 6 stems combining both modes **VERY EXPERIMENTAL**:
+    - MODE_HYBRID_6STEM: 6 stems combining the best of both worlds:
         * vocals/drums/bass -> average (ensemble) of the 3 four-stem models
         * guitar/piano/other -> htdemucs_6s run with high shifts+overlap
           (more precise), since it's the only model that can reliably
@@ -359,7 +459,10 @@ class SeparatorApp:
         self.root.minsize(480, 420)
         self.root.configure(bg=COLOR_BG)
 
-        self.output_root = tk.StringVar(value=str(Path.home() / "AI_Separations"))
+        self.settings = load_settings()
+        default_output = self.settings.get("last_parent_folder") or str(Path.home() / "AI_Separations")
+
+        self.output_root = tk.StringVar(value=default_output)
         self.input_file = tk.StringVar(value="")
         self.status_text = tk.StringVar(value="Waiting for an audio file...")
         self.volume = tk.DoubleVar(value=70.0)
@@ -368,6 +471,8 @@ class SeparatorApp:
         self.log_queue = queue.Queue()
         self.current_stem_files = {}
         self.current_stem_list = STEM_NAMES_6
+        self.current_song_name = None
+        self.previous_separations = []
 
         # Playback / seek state
         self.track_length_sec = 0.0
@@ -384,6 +489,11 @@ class SeparatorApp:
         self._build_ui()
         self._poll_queue()
         self._tick_seekbar()
+
+        # Persist the parent folder whenever it changes, and load any
+        # previous separations already sitting inside it.
+        self.output_root.trace_add("write", self._on_output_root_changed)
+        self._refresh_previous_separations()
 
     # ---------------------------------------------------------- ttk theme
     def _setup_style(self):
@@ -506,6 +616,31 @@ class SeparatorApp:
         ttk.Button(frame_out, text="Choose folder...", command=self.choose_output_folder).pack(
             side="left", padx=(0, 10), pady=10
         )
+        ttk.Label(frame_out, text="Remembered automatically for next time.",
+                  style="Muted.TLabel", background=COLOR_BG).pack(
+            anchor="w", padx=10, pady=(0, 8)
+        )
+
+        # -- 1b. Previous separations found in that folder --
+        frame_previous = ttk.LabelFrame(root, text="Previous separations in this folder")
+        frame_previous.pack(fill="x", **pad)
+
+        prev_top_row = ttk.Frame(frame_previous)
+        prev_top_row.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(
+            prev_top_row,
+            text="Load an existing separation into the mixer without re-processing it.",
+            style="Muted.TLabel", background=COLOR_BG,
+        ).pack(side="left")
+        ttk.Button(prev_top_row, text="Refresh", command=self._refresh_previous_separations).pack(side="right")
+
+        self.previous_list_frame = ttk.Frame(frame_previous)
+        self.previous_list_frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.previous_empty_label = ttk.Label(
+            self.previous_list_frame, text="No previous separations found yet.",
+            style="Muted.TLabel", background=COLOR_BG,
+        )
+        self.previous_empty_label.pack(anchor="w")
 
         # -- 2. Drop zone --
         frame_drop = ttk.LabelFrame(root, text="2.  Drag your song here (or click to browse)")
@@ -691,7 +826,10 @@ class SeparatorApp:
                 "scale": scale,
                 "path_label": path_label,
                 "sound": None,
+                "samples": None,
+                "sample_rate": None,
                 "channel": None,
+                "playing_sound": None,
             }
 
     # ---------------------------------------------------------- callbacks
@@ -699,6 +837,82 @@ class SeparatorApp:
         folder = filedialog.askdirectory(title="Choose the parent folder")
         if folder:
             self.output_root.set(folder)
+
+    def _on_output_root_changed(self, *_args):
+        """Persists the parent folder to disk and refreshes the list of
+        previous separations found inside it."""
+        folder = self.output_root.get().strip()
+        self.settings["last_parent_folder"] = folder
+        save_settings(self.settings)
+        self._refresh_previous_separations()
+
+    def _refresh_previous_separations(self):
+        """Scans the current parent folder for separations made in earlier
+        sessions and rebuilds the "Previous separations" list in the UI."""
+        folder = self.output_root.get().strip()
+        self.previous_separations = find_previous_separations(folder) if folder else []
+
+        for widget in self.previous_list_frame.winfo_children():
+            widget.destroy()
+
+        if not self.previous_separations:
+            self.previous_empty_label = ttk.Label(
+                self.previous_list_frame, text="No previous separations found yet.",
+                style="Muted.TLabel", background=COLOR_BG,
+            )
+            self.previous_empty_label.pack(anchor="w")
+            return
+
+        for item in self.previous_separations:
+            row = tk.Frame(self.previous_list_frame, bg=COLOR_BG_ALT)
+            row.pack(fill="x", pady=3)
+            inner = tk.Frame(row, bg=COLOR_BG_ALT)
+            inner.pack(fill="x", padx=10, pady=6)
+
+            text = f"{item['song']}  \u2022  {item['label']}"
+            tk.Label(inner, text=text, bg=COLOR_BG_ALT, fg=COLOR_TEXT,
+                     anchor="w", font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
+
+            ttk.Button(
+                inner, text="Load into mixer",
+                command=lambda it=item: self._load_previous_separation(it)
+            ).pack(side="right", padx=(8, 0))
+            ttk.Button(
+                inner, text="Open folder",
+                command=lambda it=item: self._open_folder(it["folder"])
+            ).pack(side="right")
+
+    def _open_folder(self, folder_path):
+        """Opens the given folder in the OS file explorer."""
+        folder_path = str(folder_path)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(folder_path)  # noqa: F821 (Windows only)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder_path])
+            else:
+                subprocess.Popen(["xdg-open", folder_path])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open the folder: {e}")
+
+    def _load_previous_separation(self, item):
+        """Loads a previously generated separation straight into the mixer,
+        without running Demucs again."""
+        self.stop_playback()
+        # Use whichever stem set actually matches the files found, preferring
+        # the 6-stem layout whenever guitar/piano are present.
+        if any(s in item["files"] for s in ("guitar", "piano")):
+            stem_list = STEM_NAMES_6
+        else:
+            stem_list = STEM_NAMES_4
+
+        self._render_stem_placeholders(stem_list)
+        self.current_stem_files = item["files"]
+        self.current_song_name = item["song"]
+        self._update_stem_rows()
+        self.status_text.set(
+            f"Loaded previous separation for '{item['song']}' from: {item['folder']}"
+        )
 
     def choose_input_file(self):
         file_path = filedialog.askopenfilename(
@@ -768,7 +982,9 @@ class SeparatorApp:
                         f"Done. Files saved to: {payload['folder']}"
                     )
                     self.current_stem_files = payload["files"]
+                    self.current_song_name = payload.get("song")
                     self._update_stem_rows()
+                    self._refresh_previous_separations()
         except queue.Empty:
             pass
         self.root.after(150, self._poll_queue)
@@ -778,14 +994,26 @@ class SeparatorApp:
         for stem, info in self.stem_rows.items():
             if stem in self.current_stem_files:
                 path = self.current_stem_files[stem]
+                sound = None
+                samples = None
+                sample_rate = None
                 try:
                     sound = pygame.mixer.Sound(path)
                     length = sound.get_length()
                     max_length = max(max_length, length)
+                    # Keep the raw sample array too, so we can create a
+                    # trimmed Sound starting at an arbitrary position when
+                    # the user drags the seek bar (pygame Channels have no
+                    # native seek/set_pos support for Sound objects).
+                    samples = pygame.sndarray.array(sound)
+                    mixer_freq, _fmt, _channels = pygame.mixer.get_init()
+                    sample_rate = mixer_freq
                 except Exception as e:
                     self._log_append(f"Could not load {stem}: {e}")
                     sound = None
                 info["sound"] = sound
+                info["samples"] = samples
+                info["sample_rate"] = sample_rate
                 info["channel"] = None
                 info["mute_var"].set(False)
                 info["vol_var"].set(100.0)
@@ -797,6 +1025,8 @@ class SeparatorApp:
                 )
             else:
                 info["sound"] = None
+                info["samples"] = None
+                info["sample_rate"] = None
                 info["channel"] = None
                 info["mute_btn"].config(state="disabled")
                 info["scale"].config(state="disabled")
@@ -863,24 +1093,42 @@ class SeparatorApp:
         self._start_playback_from(self.playback_offset_sec if not self.is_playing else 0.0)
 
     def _start_playback_from(self, start_seconds):
-        """(Re)starts playback of every loaded stem from start_seconds."""
+        """(Re)starts playback of every loaded stem from start_seconds.
+        pygame's Sound/Channel API has no real seek support, so instead we
+        slice each stem's raw sample array at the target position and play
+        that trimmed slice as a brand-new Sound."""
         self._stop_channels_only()
 
         start_seconds = max(0.0, min(start_seconds, self.track_length_sec or 0.0))
         started_any = False
         for stem, info in self.stem_rows.items():
-            sound = info["sound"]
-            if sound is None:
+            base_sound = info["sound"]
+            samples = info.get("samples")
+            sample_rate = info.get("sample_rate")
+            if base_sound is None:
                 continue
-            channel = sound.play(loops=0)
+
+            play_sound = base_sound
+            if samples is not None and sample_rate and start_seconds > 0:
+                start_frame = int(start_seconds * sample_rate)
+                if start_frame < len(samples):
+                    trimmed = samples[start_frame:]
+                    try:
+                        play_sound = pygame.sndarray.make_sound(trimmed)
+                    except Exception:
+                        play_sound = base_sound
+                else:
+                    # Seeked past the end of this particular stem; nothing left to play.
+                    continue
+
+            channel = play_sound.play(loops=0)
             if channel is None:
                 self._log_append(f"Could not assign an audio channel for {stem} (too many active channels?)")
                 continue
-            try:
-                channel.set_pos(start_seconds)
-            except Exception:
-                pass
             info["channel"] = channel
+            # Keep a reference to the (possibly trimmed) Sound so pygame
+            # doesn't garbage-collect it while it's still playing.
+            info["playing_sound"] = play_sound
             started_any = True
 
         if not started_any:
@@ -902,6 +1150,7 @@ class SeparatorApp:
                 except Exception:
                     pass
                 info["channel"] = None
+            info["playing_sound"] = None
 
     def stop_playback(self):
         self._stop_channels_only()
