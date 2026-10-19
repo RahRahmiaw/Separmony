@@ -4,3 +4,8 @@ pygame
 soundfile
 numpy
 torch
+
+# Needed for Mode 3 (BS-Roformer-SW). Use "audio-separator[cpu]" if you have no NVIDIA GPU.
+# NOTE: installing it can replace a CUDA build of torch with a CPU-only one.
+# If that happens, reinstall the CUDA build (see the README, "Installation").
+audio-separator[gpu]

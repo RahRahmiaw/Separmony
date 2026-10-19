@@ -1,5 +1,5 @@
 """
-AI Instrument Separator (Demucs)
+AI Instrument Separator (Demucs + BS-Roformer-SW)
 =========================================================
 Desktop GUI application that allows you to:
 - Drag and drop an audio file (or select it manually)
@@ -11,11 +11,13 @@ Desktop GUI application that allows you to:
       using an ENSEMBLE (average) of htdemucs + htdemucs_ft + mdx_extra,
       which reduces artifacts/"muffled" sound at the cost of more
       processing time and without separating guitar/piano
-    * 6 instruments in High Quality (hybrid): vocals/drums/bass come
-      from the 3-model ensemble (same as the previous mode), and
-      guitar/piano/other come from htdemucs_6s run with high shifts
-      and overlap for better precision - the slowest mode but the
-      cleanest one available for the full 6 stems
+    * 6 instruments in High Quality (hybrid):
+        - vocals/drums/bass come from the 3-model ensemble (same as the
+          previous mode)
+        - guitar/piano come from BS-Roformer-SW (a 6-stem Roformer model,
+          much cleaner than htdemucs_6s), run through audio-separator
+        - "other" is the ensemble's "other" minus guitar and piano
+      This is the slowest mode but the cleanest one for the full 6 stems
 - Save the results in a subfolder "Instruments <SongName> (4/6 stems)"
   inside the chosen parent folder
 - Built-in mixer: play all instruments AT THE SAME TIME,
@@ -30,9 +32,12 @@ Desktop GUI application that allows you to:
 
 Requirements (install before running, see requirements.txt):
     pip install -r requirements.txt
+    pip install "audio-separator[gpu]"     (for the hybrid mode)
+    FFmpeg must be installed and available in PATH
+    (Windows: winget install Gyan.FFmpeg, then restart the terminal)
 
 Usage:
-    python separator.py
+    python separmony.py
 """
 
 import os
@@ -73,11 +78,29 @@ except ImportError:
 
 
 # ----------------------------------------------------------------------
+# Persistent app settings location
+# (defined first because other constants below depend on it)
+# ----------------------------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".ai_instrument_separator"
+CONFIG_FILE = CONFIG_DIR / "settings.json"
+
+
+# ----------------------------------------------------------------------
 # General configuration
 # ----------------------------------------------------------------------
 
 MODEL_6STEM = "htdemucs_6s"
 ENSEMBLE_MODELS = ["htdemucs", "htdemucs_ft", "mdx_extra"]  # averaged together
+
+# BS-Roformer-SW (6 stems), used in step 2 of the hybrid mode via audio-separator
+ROFORMER_SW_MODEL = "BS-Roformer-SW.ckpt"
+ROFORMER_MODELS_DIR = CONFIG_DIR / "models"   # keeps models out of the default /tmp/ path
+
+# What BS-Roformer-SW receives in step 2 of the hybrid mode:
+#   "full"  -> the original song (recommended, sounds great)
+#   "other" -> the ensemble's averaged "other" stem
+STEP2_SOURCE = "full"
 
 STEM_NAMES_6 = ["vocals", "drums", "bass", "guitar", "piano", "other"]
 STEM_NAMES_4 = ["vocals", "drums", "bass", "other"]
@@ -97,11 +120,6 @@ MODE_6STEM = "6stem"
 MODE_ENSEMBLE = "ensemble"
 MODE_HYBRID_6STEM = "hybrid6"
 
-# "shifts" and "overlap" parameters used to improve htdemucs_6s precision
-# in hybrid mode (slower, but cleaner for guitar/piano/other)
-HYBRID_SHIFTS = 5
-HYBRID_OVERLAP = 0.5
-
 # ----------------------------------------------------------------------
 # Color palette (modern, dark, based on #020e21)
 # ----------------------------------------------------------------------
@@ -117,13 +135,6 @@ COLOR_ACCENT_DARK = "#2563eb"
 COLOR_SUCCESS = "#22c55e"
 COLOR_ERROR = "#ef4444"
 COLOR_TRACK = "#132a52"       # slider track background
-
-# ----------------------------------------------------------------------
-# Persistent app settings (remembers the last parent folder between runs)
-# ----------------------------------------------------------------------
-
-CONFIG_DIR = Path.home() / ".ai_instrument_separator"
-CONFIG_FILE = CONFIG_DIR / "settings.json"
 
 
 def load_settings():
@@ -231,6 +242,70 @@ def get_device_info():
 
 
 # ----------------------------------------------------------------------
+# FFmpeg auto-detection (so the program works without touching PATH by hand)
+# ----------------------------------------------------------------------
+
+def ensure_ffmpeg_in_path():
+    """
+    Makes sure FFmpeg can be found by this process (and by the programs it
+    launches). On Windows, a program started from a terminal/editor that was
+    opened BEFORE FFmpeg was installed doesn't see the updated PATH, so we:
+      1. reload PATH from the Windows registry (machine + user), and
+      2. if it's still missing, look for ffmpeg.exe inside the folders where
+         winget installs it.
+    Returns True if ffmpeg is now available.
+    """
+    if shutil.which("ffmpeg"):
+        return True
+
+    if sys.platform.startswith("win"):
+        # 1. Reload PATH from the registry
+        try:
+            import winreg
+            parts = []
+            locations = (
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                (winreg.HKEY_CURRENT_USER, "Environment"),
+            )
+            for hive, subkey in locations:
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        value, _type = winreg.QueryValueEx(key, "Path")
+                        parts.append(os.path.expandvars(value))
+                except OSError:
+                    pass
+            if parts:
+                os.environ["PATH"] = os.pathsep.join(parts + [os.environ.get("PATH", "")])
+        except Exception:
+            pass
+
+        if shutil.which("ffmpeg"):
+            return True
+
+        # 2. Look inside winget's install folders
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            winget_root = Path(local_appdata) / "Microsoft" / "WinGet"
+            candidates = []
+            links_dir = winget_root / "Links"
+            if (links_dir / "ffmpeg.exe").exists():
+                candidates.append(links_dir)
+            packages_dir = winget_root / "Packages"
+            if packages_dir.is_dir():
+                try:
+                    candidates.extend(p.parent for p in packages_dir.rglob("ffmpeg.exe"))
+                except Exception:
+                    pass
+            for folder in candidates:
+                os.environ["PATH"] = str(folder) + os.pathsep + os.environ.get("PATH", "")
+                if shutil.which("ffmpeg"):
+                    return True
+
+    return shutil.which("ffmpeg") is not None
+
+
+# ----------------------------------------------------------------------
 # Separation logic (runs on a separate thread so the UI doesn't freeze)
 # ----------------------------------------------------------------------
 
@@ -299,6 +374,91 @@ def _average_wavs(paths, destination):
     sf.write(str(destination), averaged, samplerate)
 
 
+def _sum_wavs(paths, destination):
+    """Sums (adds) a list of .wav files together and saves the result.
+    Unlike _average_wavs, nothing is divided: the stems are layered on top
+    of each other. The result is clipped to [-1, 1] to avoid wraparound."""
+    if not SOUNDFILE_AVAILABLE:
+        raise RuntimeError("Missing 'soundfile' library to sum audio (pip install soundfile).")
+
+    data_list = []
+    samplerate = None
+    for p in paths:
+        data, sr = sf.read(str(p))
+        if samplerate is None:
+            samplerate = sr
+        elif sr != samplerate:
+            raise RuntimeError(f"Different sample rates: {sr} vs {samplerate}")
+        data_list.append(data)
+
+    min_len = min(d.shape[0] for d in data_list)
+    data_list = [d[:min_len] for d in data_list]
+
+    summed = np.sum(np.stack(data_list, axis=0), axis=0)
+    summed = np.clip(summed, -1.0, 1.0)
+    sf.write(str(destination), summed, samplerate)
+
+
+def _subtract_wavs(base_path, subtract_paths, destination):
+    """Computes base - sum(subtract_paths) and saves it, clipped to [-1, 1]."""
+    if not SOUNDFILE_AVAILABLE:
+        raise RuntimeError("Missing 'soundfile' library (pip install soundfile).")
+
+    base, sr = sf.read(str(base_path))
+    result = base.copy()
+    for p in subtract_paths:
+        data, sr2 = sf.read(str(p))
+        if sr2 != sr:
+            raise RuntimeError(f"Different sample rates: {sr2} vs {sr}")
+        n = min(result.shape[0], data.shape[0])
+        result = result[:n] - data[:n]
+    result = np.clip(result, -1.0, 1.0)
+    sf.write(str(destination), result, sr)
+
+
+def _run_roformer_sw(input_file, out_dir, log_queue):
+    """Runs BS-Roformer-SW (6 stems) through audio-separator. Returns a folder
+    containing vocals.wav, drums.wav, bass.wav, guitar.wav, piano.wav, other.wav."""
+    try:
+        from audio_separator.separator import Separator
+    except ImportError:
+        raise RuntimeError(
+            "Missing 'audio-separator'. Install it with: pip install \"audio-separator[gpu]\""
+        )
+
+    if not ensure_ffmpeg_in_path():
+        raise RuntimeError(
+            "FFmpeg was not found. Install it with: winget install Gyan.FFmpeg "
+            "and then start this program again."
+        )
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ROFORMER_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    log_queue.put(("log", f"--- Running model: {ROFORMER_SW_MODEL} (first run downloads ~700 MB) ---"))
+    separator = Separator(
+        output_dir=str(out_dir),
+        output_format="WAV",
+        model_file_dir=str(ROFORMER_MODELS_DIR),
+    )
+    separator.load_model(model_filename=ROFORMER_SW_MODEL)
+    separator.separate(str(input_file))
+
+    # Files come out like "<input>_(guitar)_BS-Roformer-SW.wav";
+    # rename them to plain "<stem>.wav" so the pipeline can find them.
+    for stem in STEM_NAMES_6:
+        tag = f"({stem})".lower()
+        matches = [p for p in out_dir.glob("*.wav") if tag in p.name.lower()]
+        if matches:
+            target = out_dir / f"{stem}.wav"
+            if matches[0] != target:
+                matches[0].replace(target)
+        else:
+            log_queue.put(("log", f"Warning: {ROFORMER_SW_MODEL} produced no '{stem}' file"))
+    return out_dir
+
+
 def run_separation(input_file: str, output_root: str, mode: str, log_queue: "queue.Queue"):
     """
     Runs the separation according to the chosen mode:
@@ -307,9 +467,10 @@ def run_separation(input_file: str, output_root: str, mode: str, log_queue: "que
       instrument by instrument to reduce artifacts.
     - MODE_HYBRID_6STEM: 6 stems combining the best of both worlds:
         * vocals/drums/bass -> average (ensemble) of the 3 four-stem models
-        * guitar/piano/other -> htdemucs_6s run with high shifts+overlap
-          (more precise), since it's the only model that can reliably
-          separate guitar and piano from "other"
+        * guitar/piano -> BS-Roformer-SW (via audio-separator)
+        * other -> ensemble "other" minus guitar and piano
+          (or, if STEP2_SOURCE == "other", the sum of BS-Roformer-SW's
+          leftover stems)
     """
     song_name = Path(input_file).stem
     stems_label = {
@@ -378,61 +539,103 @@ def run_separation(input_file: str, output_root: str, mode: str, log_queue: "que
                 log_queue.put((
                     "status",
                     f"Separating '{song_name}' into 6 High Quality instruments "
-                    f"(vocals/drums/bass via ensemble + guitar/piano/other via {MODEL_6STEM} with shifts)... "
+                    f"(step 1: 3-model ensemble; step 2: {ROFORMER_SW_MODEL})... "
                     "This is the slowest mode."
                 ))
 
                 moved_files = {}
 
-                # --- Part 1: vocals/drums/bass via ensemble of 3 four-stem models ---
-                with tempfile.TemporaryDirectory(prefix="hybrid_ensemble_") as tmp_root:
+                with tempfile.TemporaryDirectory(prefix="hybrid_work_") as work_root:
+                    work_root = Path(work_root)
+
+                    # --- Step 1: same process as the 4-stem HQ mode ---
+                    ensemble_root = work_root / "ensemble"
+                    ensemble_root.mkdir()
                     model_out_dirs = []
                     for model_name in ENSEMBLE_MODELS:
-                        out_dir = _run_single_demucs(model_name, safe_input, tmp_root, log_queue)
+                        out_dir = _run_single_demucs(model_name, safe_input, ensemble_root, log_queue)
                         model_out_dirs.append(out_dir)
 
-                    log_queue.put(("status", "Averaging vocals/drums/bass across the 3 models..."))
-                    for stem in ["vocals", "drums", "bass"]:
+                    log_queue.put(("status", "Step 1: averaging the 3 models (vocals/drums/bass/other)..."))
+
+                    # The averaged "other" is only an intermediate file
+                    step2_input_dir = work_root / "step2_input"
+                    step2_input_dir.mkdir()
+                    averaged_other = step2_input_dir / "other_input.wav"
+
+                    for stem in STEM_NAMES_4:  # vocals, drums, bass, other
                         stem_paths = [d / f"{stem}.wav" for d in model_out_dirs]
                         stem_paths = [p for p in stem_paths if p.exists()]
                         if not stem_paths:
                             log_queue.put(("log", f"Warning: no model generated {stem}.wav"))
                             continue
-                        dst = final_folder / f"{stem}.wav"
+
+                        dst = final_folder / f"{stem}.wav" if stem != "other" else averaged_other
                         if len(stem_paths) == 1:
                             shutil.copy(str(stem_paths[0]), str(dst))
                         else:
                             _average_wavs(stem_paths, dst)
-                        moved_files[stem] = str(dst)
                         log_queue.put(("log", f"{stem}: averaged from {len(stem_paths)} models -> {dst.name}"))
 
-                # --- Part 2: guitar/piano/other via htdemucs_6s with shifts+overlap ---
-                with tempfile.TemporaryDirectory(prefix="hybrid_6s_") as tmp_root2:
+                        if stem != "other":
+                            moved_files[stem] = str(dst)
+
+                    if not averaged_other.exists():
+                        raise RuntimeError("Step 1 did not produce an 'other' stem.")
+
+                    # --- Step 2: BS-Roformer-SW for guitar and piano ---
+                    step2_input = safe_input if STEP2_SOURCE == "full" else averaged_other
                     log_queue.put((
                         "status",
-                        f"Separating guitar/piano/other with {MODEL_6STEM} "
-                        f"(shifts={HYBRID_SHIFTS}, overlap={HYBRID_OVERLAP})..."
+                        f"Step 2: separating guitar/piano with {ROFORMER_SW_MODEL} "
+                        f"(input: {'original song' if STEP2_SOURCE == 'full' else 'ensemble other stem'})..."
                     ))
-                    extra_args = ["--shifts", str(HYBRID_SHIFTS), "--overlap", str(HYBRID_OVERLAP)]
-                    out_dir_6s = _run_single_demucs(
-                        MODEL_6STEM, safe_input, tmp_root2, log_queue, extra_args=extra_args
-                    )
-                    for stem in ["guitar", "piano", "other"]:
+                    step2_root = work_root / "step2"
+                    step2_root.mkdir()
+                    out_dir_6s = _run_roformer_sw(step2_input, step2_root, log_queue)
+
+                    # Keep only guitar and piano
+                    kept = []
+                    for stem in ["guitar", "piano"]:
                         src = out_dir_6s / f"{stem}.wav"
                         if src.exists():
                             dst = final_folder / f"{stem}.wav"
                             shutil.copy(str(src), str(dst))
                             moved_files[stem] = str(dst)
+                            kept.append(dst)
                         else:
                             log_queue.put(("log", f"Warning: {stem}.wav was not generated"))
+
+                    # Build the final "other"
+                    log_queue.put(("status", "Building the final 'other' stem..."))
+                    dst = final_folder / "other.wav"
+                    if STEP2_SOURCE == "full":
+                        # ensemble "other" minus guitar and piano
+                        _subtract_wavs(averaged_other, kept, dst)
+                        log_queue.put(("log", "other: ensemble 'other' minus guitar and piano"))
+                        moved_files["other"] = str(dst)
+                    else:
+                        leftover_paths = [out_dir_6s / f"{s}.wav" for s in ["vocals", "drums", "bass", "other"]]
+                        leftover_paths = [p for p in leftover_paths if p.exists()]
+                        if leftover_paths:
+                            _sum_wavs(leftover_paths, dst)
+                            moved_files["other"] = str(dst)
+                            log_queue.put(("log", f"other: sum of {len(leftover_paths)} leftover stems"))
+                        else:
+                            log_queue.put(("log", "Warning: no leftover stems to build 'other'"))
 
                 log_queue.put(("done", {"folder": str(final_folder), "files": moved_files, "song": song_name}))
 
             else:
                 log_queue.put(("error", f"Unknown mode: {mode}"))
 
-    except FileNotFoundError:
-        log_queue.put(("error", "'demucs' was not found. Install it with: pip install demucs"))
+    except FileNotFoundError as e:
+        log_queue.put((
+            "error",
+            f"A required program or file was not found: {e}\n"
+            "Check that demucs and ffmpeg are installed and available in PATH "
+            "(restart this program from a NEW terminal after installing them)."
+        ))
     except Exception as e:
         log_queue.put(("error", f"Unexpected error: {e}"))
 
@@ -689,8 +892,8 @@ class SeparatorApp:
 
         ttk.Radiobutton(
             frame_mode,
-            text="6 instruments in High Quality (vocals/drums/bass via ensemble + guitar/piano/other\n"
-                 "with shifts) - the cleanest option for all 6 stems, but also the slowest",
+            text="6 instruments in High Quality (vocals/drums/bass via ensemble + guitar/piano\n"
+                 "via BS-Roformer-SW) - the cleanest option for all 6 stems, but also the slowest",
             variable=self.mode, value=MODE_HYBRID_6STEM,
         ).pack(anchor="w", padx=10, pady=(3, 10))
 
@@ -897,7 +1100,7 @@ class SeparatorApp:
 
     def _load_previous_separation(self, item):
         """Loads a previously generated separation straight into the mixer,
-        without running Demucs again."""
+        without running the separation again."""
         self.stop_playback()
         # Use whichever stem set actually matches the files found, preferring
         # the 6-stem layout whenever guitar/piano are present.
@@ -1210,6 +1413,8 @@ class SeparatorApp:
 # ----------------------------------------------------------------------
 
 def main():
+    ensure_ffmpeg_in_path()
+
     if DND_AVAILABLE:
         root = TkinterDnD.Tk()
     else:
